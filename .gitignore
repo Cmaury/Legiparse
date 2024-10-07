@@ -1,0 +1,17 @@
+#alembic
+alembic
+alebic.ini
+
+#ignore env
+/myenv
+
+#ignore config files
+config.*
+
+
+# Ignore log files
+*.log
+
+#caches
+__pycache__
+.pytest_cache
