@@ -93,9 +93,17 @@ def parse_meeting_datetime(date_str, time_str=None):
 
     return parsed_date
 
-# Function to get meeting details from Legistar URL
 
 def get_meeting_details(url):
+    """
+    Fetches and extracts meeting details from the given URL.
+
+    Args:
+        url (str): The URL of the meeting page.
+
+    Returns:
+        dict: A dictionary containing meeting details.
+    """
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
@@ -204,10 +212,19 @@ def get_meeting_details(url):
         logging.error(f"Unexpected error in get_meeting_details for {url}: {e}")
         return {}
 
-# Function to get meeting data from Legistar URL
+
 def get_meeting_data(url):
+    """
+    Fetches and extracts meeting data (agenda items) from the given Legistar URL.
+
+    Args:
+        url (str): The Legistar URL of the meeting.
+
+    Returns:
+        tuple: A tuple containing headers (list) and data (list of lists).
+    """
     try:
-        response = requests.get(url)
+        response = requests.get(url, timeout=10)
         response.raise_for_status()
         soup = BeautifulSoup(response.content, 'html.parser')
 
@@ -249,7 +266,7 @@ def get_meeting_data(url):
         logging.error(f"Unexpected error in get_meeting_data for {url}: {e}")
         return [], []
 
-# Function to get legislation text from its detail page
+
 def get_legislation_text(url):
     """
     Fetches and extracts the legislation text from the given URL.
@@ -348,8 +365,17 @@ def get_legislation_text(url):
         logging.error(f"Unexpected error in get_legislation_text for {url}: {e}")
         return ''
 
-# Helper function to get or create GoverningBody
+
 def get_or_create_governing_body(session):
+    """
+    Retrieves the GoverningBody from the database or creates it if it doesn't exist.
+
+    Args:
+        session: Database session.
+
+    Returns:
+        GoverningBody instance or None if failed.
+    """
     governing_body = session.query(GoverningBody).filter_by(
         name='City Council',
         city='Pittsburgh'
@@ -376,8 +402,19 @@ def get_or_create_governing_body(session):
         logging.info(f"Retrieved GoverningBody: {governing_body.name} (ID: {governing_body.governingbodyid})")
     return governing_body
 
-# Helper function to get or create MeetingType
+
 def get_or_create_meeting_type(session, meeting_name, governing_body):
+    """
+    Retrieves the MeetingType from the database or creates it if it doesn't exist.
+
+    Args:
+        session: Database session.
+        meeting_name (str): The name of the meeting.
+        governing_body (GoverningBody): The governing body associated with the meeting.
+
+    Returns:
+        MeetingType instance or None if failed.
+    """
     meeting_type = session.query(MeetingType).filter_by(
         name=meeting_name,
         governingbodyid=governing_body.governingbodyid
@@ -401,13 +438,32 @@ def get_or_create_meeting_type(session, meeting_name, governing_body):
         logging.info(f"Retrieved MeetingType: {meeting_type.name} (ID: {meeting_type.meetingtypeid})")
     return meeting_type
 
-# Helper function to get or create Meeting
+
 def get_or_create_meeting(session, meeting_name, meeting_datetime, agenda_status, minutes_status,
                           meeting_location, published_agenda_url, published_minutes_url,
                           meeting_video_url, meeting_type, meeting_url, transcript):
+    """
+    Retrieves the Meeting from the database or creates it if it doesn't exist.
+
+    Args:
+        session: Database session.
+        meeting_name (str): Name of the meeting.
+        meeting_datetime (datetime): Date and time of the meeting.
+        agenda_status (str): Status of the agenda.
+        minutes_status (str): Status of the minutes.
+        meeting_location (str): Location of the meeting.
+        published_agenda_url (str): URL of the published agenda.
+        published_minutes_url (str): URL of the published minutes.
+        meeting_video_url (str): URL of the meeting video.
+        meeting_type (MeetingType): Type of the meeting.
+        meeting_url (str): URL of the meeting page.
+        transcript (str): Transcript status.
+
+    Returns:
+        Meeting instance or None if failed.
+    """
     meeting = session.query(Meeting).filter_by(
-        name=meeting_name,
-        datetime=meeting_datetime
+        meetingurl=meeting_url
     ).first()
     if not meeting:
         meeting = Meeting(
@@ -421,7 +477,8 @@ def get_or_create_meeting(session, meeting_name, meeting_datetime, agenda_status
             videourl=meeting_video_url,
             meeting_type=meeting_type,
             meetingurl=meeting_url,
-            transcript=transcript
+            transcript=transcript,
+            processed=False  # Initially not processed
         )
         session.add(meeting)
         try:
@@ -433,11 +490,58 @@ def get_or_create_meeting(session, meeting_name, meeting_datetime, agenda_status
             logging.error(f"Database error while creating Meeting: {e}")
             return None
     else:
-        logging.info(f"Retrieved Meeting: {meeting.name} (ID: {meeting.meetingid})")
+        # Update meeting details if they have changed and meeting is still in the future
+        if meeting.datetime >= datetime.now():
+            updated = False
+            if meeting.name != meeting_name:
+                meeting.name = meeting_name
+                updated = True
+            if meeting.agendastatus != agenda_status:
+                meeting.agendastatus = agenda_status
+                updated = True
+            if meeting.minutesstatus != minutes_status:
+                meeting.minutesstatus = minutes_status
+                updated = True
+            if meeting.location != meeting_location:
+                meeting.location = meeting_location
+                updated = True
+            if meeting.publishedagendaurl != published_agenda_url:
+                meeting.publishedagendaurl = published_agenda_url
+                updated = True
+            if meeting.publishedminutesurl != published_minutes_url:
+                meeting.publishedminutesurl = published_minutes_url
+                updated = True
+            if meeting.videourl != meeting_video_url:
+                meeting.videourl = meeting_video_url
+                updated = True
+            if meeting.transcript != transcript:
+                meeting.transcript = transcript
+                updated = True
+            if updated:
+                try:
+                    session.commit()
+                    logging.info(f"Updated Meeting: {meeting.name} (ID: {meeting.meetingid})")
+                except SQLAlchemyError as e:
+                    session.rollback()
+                    logging.error(f"Database error while updating Meeting: {e}")
+                    return None
+        else:
+            logging.info(f"Meeting '{meeting.name}' is in the past. Skipping updates.")
+            return None
     return meeting
 
-# Helper function to get or create Agenda
+
 def get_or_create_agenda(session, meeting):
+    """
+    Retrieves the Agenda from the database or creates it if it doesn't exist.
+
+    Args:
+        session: Database session.
+        meeting (Meeting): The associated Meeting instance.
+
+    Returns:
+        Agenda instance or None if failed.
+    """
     agenda = session.query(Agenda).filter_by(
         meetingid=meeting.meetingid
     ).first()
@@ -455,10 +559,6 @@ def get_or_create_agenda(session, meeting):
         except SQLAlchemyError as e:
             session.rollback()
             logging.error(f"Database error while creating Agenda: {e}")
-            return None
-    else:
-        logging.info(f"Retrieved Agenda: {agenda.title} (ID: {agenda.agendaid})")
-    return agenda
 
 # Function to save Legislation
 def save_legislation(session, file_number, version, status, description, link, index):
