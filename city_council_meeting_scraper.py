@@ -81,6 +81,7 @@ def load_configuration():
 base_rss_url = ""
 delay_between_requests = 1
 
+
 def setup_requests_session():
     """
     Sets up a requests session with custom headers and retry strategy.
@@ -165,15 +166,12 @@ def process_rss_feed(shutdown_event):
                 logging.info(f"Found meeting: {meeting_title} - {meeting_url}")
 
                 # Skip processing if the meeting is in the past
-                if meeting_datetime < now:
-                    logging.info(f"Meeting '{meeting_title}' is in the past (Date: {meeting_datetime}). Skipping.")
-                    continue
 
                 # Check if the meeting already exists in the DB
                 with SessionLocal() as session:
-                    existing_meeting = session.query(Meeting).filter_by(meetingurl=meeting_url).first()
-                    if existing_meeting:
-                        if existing_meeting.datetime >= now:
+                    existing_meeting = agenda_processor.get_meeting_details(meeting_url)
+                    if existing_meeting.get('meeting_details') and existing_meeting['meeting_details'].get('Meeting Date'):
+                        if existing_meeting.meeting_details['Meeting Date'] >= now:
                             logging.info(f"Meeting '{meeting_title}' already exists and is upcoming. Updating if necessary.")
                             # Agenda processor will handle updates
                         else:
