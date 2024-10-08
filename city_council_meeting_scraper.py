@@ -1,10 +1,9 @@
 # city_council_meeting_scraper.py
 
 import logging
-import feedparser
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 import json
 import time
 from datetime import datetime
@@ -12,12 +11,14 @@ import traceback
 import signal
 import sys
 import threading
+import re
 
 import agenda_processor
 import llm_processor
 import city_council_video_transcriber
 
 from database import SessionLocal  # Ensure this import is present
+from models import Meeting  # Import Meeting model for database queries
 
 # Configure logging
 logging.basicConfig(
@@ -53,7 +54,6 @@ def process_agenda(meeting_url):
     """
     agenda_processor.save_meeting_data_to_db(meeting_url)
 
-# Load the configuration
 def load_configuration():
     """
     Loads configuration parameters from 'config.json'.
@@ -78,9 +78,8 @@ def load_configuration():
         sys.exit(1)
 
 # Initialize global variables
-base_rss_url = ""
-delay_between_requests = 1
-
+calendar_page_url = "https://pittsburgh.legistar.com/Calendar.aspx"  # Default URL
+delay_between_requests = 1  # Seconds
 
 def setup_requests_session():
     """
@@ -98,7 +97,7 @@ def setup_requests_session():
     }
 
     # Define retry strategy with exponential backoff
-    retry_strategy = Retry(
+    retry_strategy = requests.adapters.Retry(
         total=5,  # Total number of retries
         status_forcelist=[429, 500, 502, 503, 504],  # HTTP status codes to retry on
         allowed_methods=["HEAD", "GET", "OPTIONS"],  # HTTP methods to retry
@@ -106,7 +105,7 @@ def setup_requests_session():
     )
 
     # Create an HTTP adapter with the retry strategy
-    adapter = HTTPAdapter(max_retries=retry_strategy)
+    adapter = requests.adapters.HTTPAdapter(max_retries=retry_strategy)
 
     # Create a requests session and mount the adapter
     http = requests.Session()
@@ -117,158 +116,209 @@ def setup_requests_session():
     logging.debug("Exiting setup_requests_session()")
     return http
 
-def process_rss_feed(shutdown_event):
+def fetch_calendar_page(http_session, url):
     """
-    Fetches and processes RSS feed entries from the specified URL.
-    Implements custom headers, retry mechanism with exponential backoff,
-    and enhanced error handling.
+    Fetches the main calendar page content.
     
     Args:
-        shutdown_event (threading.Event): Event to signal shutdown.
-    """
-    logging.info("Starting RSS feed processing.")
-
-    # Initialize HTTP session with retries
-    http = setup_requests_session()
-
-    # Get current datetime for comparison
-    now = datetime.now()
-
-    while not shutdown_event.is_set():
-        try:
-            # Fetch RSS feed
-            rss_url = base_rss_url
-            logging.info(f"Fetching RSS feed from: {rss_url}")
-            response = http.get(rss_url, timeout=10)
-            response.raise_for_status()  # Raise an exception for HTTP errors
-
-            # Parse the RSS feed content
-            feed = feedparser.parse(response.content)
-
-            # Check for feed parsing errors
-            if feed.bozo:
-                logging.error(f"Error parsing RSS feed: {feed.bozo_exception}")
-                break  # Exit loop on parsing error
-
-            # Check if there are no entries in the feed
-            if len(feed.entries) == 0:
-                logging.info("No more entries found in the RSS feed.")
-                break  # Exit loop if no entries
-
-            # Process each entry in the feed
-            for entry in feed.entries:
-                if shutdown_event.is_set():
-                    logging.info("Shutdown signal received. Exiting RSS feed processing loop.")
-                    break
-
-                meeting_url = entry.link
-                meeting_title = entry.title
-                logging.info(f"Found meeting: {meeting_title} - {meeting_url}")
-
-                # Skip processing if the meeting is in the past
-
-                # Check if the meeting already exists in the DB
-                with SessionLocal() as session:
-                    existing_meeting = agenda_processor.get_meeting_details(meeting_url)
-                    if existing_meeting.get('meeting_details') and existing_meeting['meeting_details'].get('Meeting Date'):
-                        if existing_meeting.meeting_details['Meeting Date'] >= now:
-                            logging.info(f"Meeting '{meeting_title}' already exists and is upcoming. Updating if necessary.")
-                            # Agenda processor will handle updates
-                        else:
-                            logging.info(f"Meeting '{meeting_title}' exists but is in the past. Skipping.")
-                            continue
-                    else:
-                        logging.info(f"Meeting '{meeting_title}' is new. Processing.")
-
-                # If the meeting is new or needs updating, process it
-                try:
-                    logging.info(f"Processing agenda for: {meeting_url}")
-                    process_agenda(meeting_url)  # Replace with your actual processing function
-                    logging.info(f"Processed agenda for: {meeting_title}")
-                except Exception as e:
-                    logging.error(f"Failed to process agenda for {meeting_title}: {e}")
-                    logging.debug(traceback.format_exc())
-                    continue
-
-                # Optionally, mark the meeting as processed in the DB
-                with SessionLocal() as session:
-                    meeting = session.query(Meeting).filter_by(meetingurl=meeting_url).first()
-                    if meeting:
-                        meeting.processed = True
-                        session.commit()
-                        logging.debug(f"Marked Meeting '{meeting_title}' as processed.")
-
-                # Delay between processing entries to respect rate limits
-                logging.debug(f"Sleeping for {delay_between_requests} seconds between entries.")
-                time.sleep(delay_between_requests)
-
-            # Delay before the next fetch iteration
-            logging.debug(f"Sleeping for {delay_between_requests} seconds before fetching the next RSS feed.")
-            time.sleep(delay_between_requests)
-
-        except requests.exceptions.HTTPError as http_err:
-            logging.error(f"HTTP error occurred while fetching RSS feed: {http_err}")
-            logging.debug(traceback.format_exc())
-            break  # Exit loop on HTTP error
-        except requests.exceptions.ConnectionError as conn_err:
-            logging.error(f"Connection error occurred while fetching RSS feed: {conn_err}")
-            logging.debug(traceback.format_exc())
-            logging.info("Waiting before retrying due to connection error.")
-            time.sleep(delay_between_requests * 2)  # Wait before retrying
-            continue  # Continue to next iteration
-        except requests.exceptions.Timeout as timeout_err:
-            logging.error(f"Timeout error occurred while fetching RSS feed: {timeout_err}")
-            logging.debug(traceback.format_exc())
-            logging.info("Waiting before retrying due to timeout.")
-            time.sleep(delay_between_requests * 2)  # Wait before retrying
-            continue  # Continue to next iteration
-        except requests.exceptions.RequestException as req_err:
-            logging.error(f"Request exception occurred while fetching RSS feed: {req_err}")
-            logging.debug(traceback.format_exc())
-            break  # Exit loop on other request exceptions
-        except Exception as e:
-            logging.error(f"Unexpected error occurred in RSS feed processing: {e}")
-            logging.debug(traceback.format_exc())
-            break  # Exit loop on unexpected errors
-
-    logging.info("Finished RSS feed processing.")
-
-def run_rss_feed_thread():
-    """
-    Runs the RSS feed processing in a separate daemon thread.
+        http_session (requests.Session): Configured HTTP session.
+        url (str): URL of the calendar page.
     
     Returns:
-        threading.Thread: The RSS feed processing thread.
+        BeautifulSoup object or None if fetching fails.
     """
-    rss_thread = threading.Thread(target=process_rss_feed, args=(shutdown_event,), daemon=True, name="RSS-Thread")
-    rss_thread.start()
-    return rss_thread
+    try:
+        logging.info(f"Fetching calendar page from: {url}")
+        response = http_session.get(url, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'html.parser')
+        logging.info("Successfully fetched and parsed calendar page.")
+        return soup
+    except requests.RequestException as e:
+        logging.error(f"Error fetching calendar page: {e}")
+        logging.debug(traceback.format_exc())
+        return None
+
+def extract_meetings(soup):
+    """
+    Extracts meeting detail URLs and their corresponding datetime from the calendar page.
+    
+    Args:
+        soup (BeautifulSoup): Parsed HTML of the calendar page.
+    
+    Returns:
+        List of tuples: [(meeting_url, meeting_datetime), ...]
+    """
+    meetings = []
+    try:
+        # Find all <a> tags with id containing 'hypMeetingDetail'
+        meeting_links = soup.find_all('a', id=re.compile('hypMeetingDetail'))
+        logging.info(f"Found {len(meeting_links)} meeting detail links.")
+
+        for link in meeting_links:
+            if shutdown_event.is_set():
+                logging.info("Shutdown signal received. Stopping meeting extraction.")
+                break
+
+            # Extract href and construct absolute URL
+            relative_url = link.get('href')
+            if not relative_url:
+                logging.debug("No href found in meeting link. Skipping.")
+                continue
+            meeting_url = urljoin(calendar_page_url, relative_url)
+
+            # Find the parent <tr> to locate the datetime
+            parent_tr = link.find_parent('tr')
+            if not parent_tr:
+                logging.debug("No parent <tr> found for meeting link. Skipping.")
+                continue
+
+            # Extract all <td> in the row
+            tds = parent_tr.find_all('td')
+            if not tds or len(tds) < 2:
+                logging.debug("Not enough <td> elements in row to extract datetime. Skipping.")
+                continue
+
+            # Assuming that the datetime is in the first or second <td>
+            # Adjust the index based on the actual HTML structure
+            datetime_str = tds[0].get_text(strip=True)  # Example: first <td> has date
+            meeting_datetime = parse_meeting_datetime(datetime_str)
+            if not meeting_datetime:
+                logging.debug(f"Failed to parse datetime '{datetime_str}'. Skipping.")
+                continue
+
+            meetings.append((meeting_url, meeting_datetime))
+            logging.debug(f"Extracted meeting: URL={meeting_url}, datetime={meeting_datetime}")
+
+        logging.info(f"Extracted {len(meetings)} meetings from the calendar page.")
+        return meetings
+    except Exception as e:
+        logging.error(f"Error extracting meetings: {e}")
+        logging.debug(traceback.format_exc())
+        return meetings
+
+def parse_meeting_datetime(datetime_str):
+    """
+    Parses a datetime string into a datetime object.
+    
+    Args:
+        datetime_str (str): Datetime string (e.g., '09/18/2024 10:00 AM').
+    
+    Returns:
+        datetime or None: Parsed datetime object or None if parsing fails.
+    """
+    try:
+        # Define possible datetime formats based on the website's format
+        datetime_formats = [
+            '%m/%d/%Y %I:%M %p',  # e.g., '09/18/2024 10:00 AM'
+            '%m-%d-%Y %I:%M %p',  # e.g., '09-18-2024 10:00 AM'
+            '%B %d, %Y %I:%M %p', # e.g., 'September 18, 2024 10:00 AM'
+            '%d %B %Y %I:%M %p',  # e.g., '18 September 2024 10:00 AM'
+            '%Y-%m-%d %H:%M',     # e.g., '2024-09-18 10:00'
+            '%m/%d/%Y',            # e.g., '09/18/2024' without time
+            '%m-%d-%Y',            # e.g., '09-18-2024' without time
+            '%B %d, %Y',           # e.g., 'September 18, 2024' without time
+            '%d %B %Y',            # e.g., '18 September 2024' without time
+            '%Y-%m-%d',            # e.g., '2024-09-18' without time
+        ]
+
+        for fmt in datetime_formats:
+            try:
+                parsed_datetime = datetime.strptime(datetime_str, fmt)
+                logging.debug(f"Successfully parsed datetime '{datetime_str}' with format '{fmt}'.")
+                return parsed_datetime
+            except ValueError:
+                continue  # Try next format
+
+        logging.error(f"Failed to parse datetime string: '{datetime_str}'. No matching format found.")
+        return None
+
+    except Exception as e:
+        logging.error(f"Unexpected error while parsing datetime: {e}")
+        logging.debug(traceback.format_exc())
+        return None
+
+def process_calendar_page(http_session, url):
+    """
+    Processes the main calendar page: fetches, parses, extracts meetings, and processes them.
+    
+    Args:
+        http_session (requests.Session): Configured HTTP session.
+        url (str): URL of the calendar page.
+    """
+    soup = fetch_calendar_page(http_session, url)
+    if not soup:
+        logging.error("Failed to fetch or parse the calendar page. Exiting processing.")
+        return
+
+    meetings = extract_meetings(soup)
+    if not meetings:
+        logging.info("No meetings found to process.")
+        return
+
+    now = datetime.now()
+    for meeting_url, meeting_datetime in meetings:
+        if shutdown_event.is_set():
+            logging.info("Shutdown signal received. Stopping meeting processing.")
+            break
+
+        if meeting_datetime >= now:
+            logging.info(f"Processing future meeting scheduled on {meeting_datetime} - URL: {meeting_url}")
+            try:
+                process_agenda(meeting_url)
+                logging.info(f"Successfully processed meeting: {meeting_url}")
+            except Exception as e:
+                logging.error(f"Error processing meeting {meeting_url}: {e}")
+                logging.debug(traceback.format_exc())
+        else:
+            logging.info(f"Skipping past meeting scheduled on {meeting_datetime} - URL: {meeting_url}")
+
+        # Respect rate limits by sleeping between requests
+        logging.debug(f"Sleeping for {delay_between_requests} seconds between processing meetings.")
+        time.sleep(delay_between_requests)
+
+def run_scraper_thread(http_session, url):
+    """
+    Runs the calendar page processing in a separate daemon thread.
+    
+    Args:
+        http_session (requests.Session): Configured HTTP session.
+        url (str): URL of the calendar page.
+    
+    Returns:
+        threading.Thread: The scraper thread.
+    """
+    scraper_thread = threading.Thread(target=process_calendar_page, args=(http_session, url), daemon=True, name="Scraper-Thread")
+    scraper_thread.start()
+    return scraper_thread
 
 def main():
-    global base_rss_url, delay_between_requests
+    global calendar_page_url, delay_between_requests, http_session
 
     # Load configuration
     config = load_configuration()
-    base_rss_url = config.get("calendar_rss_url")
+    calendar_page_url = config.get("calendar_page_url", "https://pittsburgh.legistar.com/Calendar.aspx")
     delay_between_requests = config.get("delay_between_requests", 1)
 
-    if not base_rss_url:
-        logging.error("Missing required configuration parameter: 'calendar_rss_url'.")
-        sys.exit(1)
+    logging.info(f"Using calendar page URL: {calendar_page_url}")
+    logging.info(f"Delay between requests: {delay_between_requests} seconds")
 
-    # Start processing RSS feed in a separate thread
-    rss_thread = run_rss_feed_thread()
+    # Setup HTTP session
+    http_session = setup_requests_session()
 
-    # Monitor the RSS thread and handle shutdown
+    # Start processing calendar page in a separate thread
+    scraper_thread = run_scraper_thread(http_session, calendar_page_url)
+
+    # Monitor the scraper thread and handle shutdown
     try:
-        while rss_thread.is_alive():
-            rss_thread.join(timeout=1)
+        while scraper_thread.is_alive():
+            scraper_thread.join(timeout=1)
             if shutdown_event.is_set():
-                logging.info("Shutdown flag set. Waiting for RSS feed processing to terminate.")
+                logging.info("Shutdown flag set. Waiting for scraper thread to terminate.")
     except KeyboardInterrupt:
         logging.info("KeyboardInterrupt received. Setting shutdown flag.")
         shutdown_event.set()
-        rss_thread.join()
+        scraper_thread.join()
 
     if shutdown_event.is_set():
         logging.info("Shutdown flag is set. Exiting main script.")
@@ -286,7 +336,7 @@ def main():
     # Start Transcription
     try:
         logging.info("Starting Transcription.")
-        city_council_video_transcriber.main()  # Ensure video_main is correctly imported and has a main() function
+        city_council_video_transcriber.main()  # Ensure video_transcriber has a main() function
         logging.info("Transcription completed successfully.")
     except Exception as e:
         logging.error(f"Transcription encountered an error: {e}")
