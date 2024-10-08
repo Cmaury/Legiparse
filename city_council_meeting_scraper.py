@@ -12,6 +12,7 @@ import signal
 import sys
 import threading
 import re
+import selenium
 
 import agenda_processor
 import llm_processor
@@ -20,9 +21,17 @@ import city_council_video_transcriber
 from database import SessionLocal  # Ensure this import is present
 from models import Meeting  # Import Meeting model for database queries
 
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.firefox.options import Options as FirefoxOptions
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,  # Change to DEBUG for more detailed logs
+    level=logging.DEBUG,  # Set to DEBUG for detailed logs
     format='%(asctime)s - %(levelname)s - %(threadName)s - %(message)s',
     handlers=[
         logging.FileHandler("city_council_meeting_scraper.log"),
@@ -118,7 +127,7 @@ def setup_requests_session():
 
 def fetch_calendar_page(http_session, url):
     """
-    Fetches the main calendar page content.
+    Fetches the main calendar page content using Selenium and parses it with BeautifulSoup.
     
     Args:
         http_session (requests.Session): Configured HTTP session.
@@ -127,17 +136,55 @@ def fetch_calendar_page(http_session, url):
     Returns:
         BeautifulSoup object or None if fetching fails.
     """
+    browser = 'chrome'
+
     try:
-        logging.info(f"Fetching calendar page from: {url}")
-        response = http_session.get(url, timeout=10)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.content, 'html.parser')
+        if browser.lower() == 'chrome':
+            options = ChromeOptions()
+            options.add_argument('--headless')  # Run in headless mode
+            options.add_argument('--disable-gpu')
+            driver = webdriver.Chrome(options=options)
+        elif browser.lower() == 'firefox':
+            options = FirefoxOptions()
+            options.add_argument('--headless')  # Run in headless mode
+            driver = webdriver.Firefox(options=options)
+        else:
+            logging.error(f"Unsupported browser: {browser}. Choose 'chrome' or 'firefox'.")
+            return None
+
+        logging.debug(f"Navigating to '{url}'.")
+        driver.get(url)
+        logging.info(f"Page loaded successfully: {url}")
+        
+        # Click the "List View" link/button to load all meetings
+        try:
+            list_view_button = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.LINK_TEXT, 'List View'))
+            )
+            list_view_button.click()
+            logging.info("Clicked the 'List View' button successfully.")
+        except TimeoutException:
+            logging.warning("List View button not found or not clickable within the timeout period.")
+            # If there's no List View, proceed without clicking
+        except NoSuchElementException:
+            logging.warning("List View button not found on the page.")
+            # If there's no List View, proceed without clicking
+
+        # Wait for specific elements to load after clicking "List View"
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CLASS_NAME, 'videolink')))
+
+        # Now, parse the page source with BeautifulSoup
+        page_source = driver.page_source
+        soup = BeautifulSoup(page_source, 'html.parser')
         logging.info("Successfully fetched and parsed calendar page.")
         return soup
-    except requests.RequestException as e:
+
+    except Exception as e:
         logging.error(f"Error fetching calendar page: {e}")
         logging.debug(traceback.format_exc())
         return None
+    finally:
+        driver.quit()
 
 def extract_meetings(soup):
     """
@@ -147,7 +194,7 @@ def extract_meetings(soup):
         soup (BeautifulSoup): Parsed HTML of the calendar page.
     
     Returns:
-        List of tuples: [(meeting_url, meeting_datetime), ...]
+        List of meeting urls occuring in the future
     """
     meetings = []
     try:
@@ -160,35 +207,24 @@ def extract_meetings(soup):
                 logging.info("Shutdown signal received. Stopping meeting extraction.")
                 break
 
+            now = datetime.now()
+
             # Extract href and construct absolute URL
+            meeting = agenda_processor.get_meeting_details(link)
+            if meeting.get('meeting_details') and meeting['meeting_details'].get('Meeting Date'):
+                if meeting.meeting_details['Meeting Date'] < now:
+                    break
+            
             relative_url = link.get('href')
             if not relative_url:
                 logging.debug("No href found in meeting link. Skipping.")
                 continue
+            
             meeting_url = urljoin(calendar_page_url, relative_url)
 
-            # Find the parent <tr> to locate the datetime
-            parent_tr = link.find_parent('tr')
-            if not parent_tr:
-                logging.debug("No parent <tr> found for meeting link. Skipping.")
-                continue
 
-            # Extract all <td> in the row
-            tds = parent_tr.find_all('td')
-            if not tds or len(tds) < 2:
-                logging.debug("Not enough <td> elements in row to extract datetime. Skipping.")
-                continue
-
-            # Assuming that the datetime is in the first or second <td>
-            # Adjust the index based on the actual HTML structure
-            datetime_str = tds[0].get_text(strip=True)  # Example: first <td> has date
-            meeting_datetime = parse_meeting_datetime(datetime_str)
-            if not meeting_datetime:
-                logging.debug(f"Failed to parse datetime '{datetime_str}'. Skipping.")
-                continue
-
-            meetings.append((meeting_url, meeting_datetime))
-            logging.debug(f"Extracted meeting: URL={meeting_url}, datetime={meeting_datetime}")
+            meetings.append(meeting_url)
+            logging.debug(f"Extracted meeting: URL={meeting_url}")
 
         logging.info(f"Extracted {len(meetings)} meetings from the calendar page.")
         return meetings
@@ -197,46 +233,6 @@ def extract_meetings(soup):
         logging.debug(traceback.format_exc())
         return meetings
 
-def parse_meeting_datetime(datetime_str):
-    """
-    Parses a datetime string into a datetime object.
-    
-    Args:
-        datetime_str (str): Datetime string (e.g., '09/18/2024 10:00 AM').
-    
-    Returns:
-        datetime or None: Parsed datetime object or None if parsing fails.
-    """
-    try:
-        # Define possible datetime formats based on the website's format
-        datetime_formats = [
-            '%m/%d/%Y %I:%M %p',  # e.g., '09/18/2024 10:00 AM'
-            '%m-%d-%Y %I:%M %p',  # e.g., '09-18-2024 10:00 AM'
-            '%B %d, %Y %I:%M %p', # e.g., 'September 18, 2024 10:00 AM'
-            '%d %B %Y %I:%M %p',  # e.g., '18 September 2024 10:00 AM'
-            '%Y-%m-%d %H:%M',     # e.g., '2024-09-18 10:00'
-            '%m/%d/%Y',            # e.g., '09/18/2024' without time
-            '%m-%d-%Y',            # e.g., '09-18-2024' without time
-            '%B %d, %Y',           # e.g., 'September 18, 2024' without time
-            '%d %B %Y',            # e.g., '18 September 2024' without time
-            '%Y-%m-%d',            # e.g., '2024-09-18' without time
-        ]
-
-        for fmt in datetime_formats:
-            try:
-                parsed_datetime = datetime.strptime(datetime_str, fmt)
-                logging.debug(f"Successfully parsed datetime '{datetime_str}' with format '{fmt}'.")
-                return parsed_datetime
-            except ValueError:
-                continue  # Try next format
-
-        logging.error(f"Failed to parse datetime string: '{datetime_str}'. No matching format found.")
-        return None
-
-    except Exception as e:
-        logging.error(f"Unexpected error while parsing datetime: {e}")
-        logging.debug(traceback.format_exc())
-        return None
 
 def process_calendar_page(http_session, url):
     """
@@ -256,22 +252,19 @@ def process_calendar_page(http_session, url):
         logging.info("No meetings found to process.")
         return
 
-    now = datetime.now()
-    for meeting_url, meeting_datetime in meetings:
+    
+    for meeting_url in meetings:
         if shutdown_event.is_set():
             logging.info("Shutdown signal received. Stopping meeting processing.")
             break
 
-        if meeting_datetime >= now:
-            logging.info(f"Processing future meeting scheduled on {meeting_datetime} - URL: {meeting_url}")
-            try:
-                process_agenda(meeting_url)
-                logging.info(f"Successfully processed meeting: {meeting_url}")
-            except Exception as e:
-                logging.error(f"Error processing meeting {meeting_url}: {e}")
-                logging.debug(traceback.format_exc())
-        else:
-            logging.info(f"Skipping past meeting scheduled on {meeting_datetime} - URL: {meeting_url}")
+        logging.info(f"Processing future meeting scheduled on  - URL: {meeting_url}")
+        try:
+            process_agenda(meeting_url)
+            logging.info(f"Successfully processed meeting: ")
+        except Exception as e:
+            logging.error(f"Error processing meeting : {e}")
+            logging.debug(traceback.format_exc())
 
         # Respect rate limits by sleeping between requests
         logging.debug(f"Sleeping for {delay_between_requests} seconds between processing meetings.")

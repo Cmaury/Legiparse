@@ -27,6 +27,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 import shutil
+
 from agenda_processor import get_meeting_details
 
 # -------------------- Setup Logging --------------------
@@ -49,7 +50,7 @@ logging.getLogger('').addHandler(rotating_handler)
 
 # Setup Console Handler
 console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.DEBUG)  # Changed to DEBUG for more detailed console output
+console_handler.setLevel(logging.INFO)  # Changed to DEBUG for more detailed console output
 console_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
 console_handler.setFormatter(console_formatter)
 logging.getLogger('').addHandler(console_handler)
@@ -130,6 +131,7 @@ def ensure_directory(directory_path):
 def generate_transcript(
     audio_file: str,
     auth_token: str,
+    whisper_model_path: str,
     whisper_model_size: str = "large",
     language: str = "en"
 ) -> str:
@@ -155,7 +157,7 @@ def generate_transcript(
         )
         logging.debug("Speaker diarization pipeline loaded.")
         
-        whisper_model = whisper.load_model(whisper_model_size)
+        whisper_model = whisper.load_model(whisper_model_path)
         logging.debug(f"Whisper model '{whisper_model_size}' loaded.")
         
         logging.info("Performing speaker diarization...")
@@ -467,6 +469,7 @@ def download_and_transcribe(source_url, config, auth_token, chromedriver_path, o
         transcript = generate_transcript(
             audio_file=audio_filename,
             auth_token=auth_token,
+            whisper_model_path= config['transcript'].get('whisper_model_path'),
             whisper_model_size=config['transcript'].get('whisper_model_size', 'large'),
             language=config['transcript'].get('language', 'en')
         )
@@ -551,6 +554,7 @@ def process_local_videos(session, video_folder, auth_token, config):
             transcript = generate_transcript(
                 audio_file=filepath,
                 auth_token=auth_token,
+                whisper_model_path= config['transcript'].get('whisper_model_path'),                
                 whisper_model_size=config['transcript'].get('whisper_model_size', 'large'),
                 language=config['transcript'].get('language', 'en')
             )
@@ -602,7 +606,7 @@ def process_db_meetings(session, auth_token, config):
 
         for meeting in untranscribed_meetings:
             meeting_id = meeting.meetingid
-            source_url = meeting.videourl if meeting.videourl else get_meeting_details(meeting.meetingurl).get('Meeting Video URL', '')
+            source_url = meeting.videourl if meeting.videourl else None
             logging.info(f"Processing Meeting ID {meeting_id} with URL: {source_url}")
 
             if not source_url:
