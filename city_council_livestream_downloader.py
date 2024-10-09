@@ -313,7 +313,7 @@ def get_in_progress_video_url(webpage_url, browser='chrome'):
         in_progress_link = in_progress_links[0]
         video_url = in_progress_link.get('href')
         logger.info(f"Extracted 'In Progress' link href: {video_url}")
-        stream_url = city_council_video_transcriber.fetch_playlist_url(video_url, config['video']['chromedriver_path'])
+        stream_url = city_council_video_transcriber.fetch_playlist_url(video_url, '/opt/homebrew/bin/chromedriver')
 
         # If the href is relative, make it absolute
         if video_url and not urllib.parse.urlparse(video_url).scheme:
@@ -366,7 +366,7 @@ def save_video_stream(stream_url, output_file, max_duration, silence_duration, s
         '-c:a', 'aac',                                         # Re-encode audio stream to AAC
         '-f', 'mp4',                                           # Output format
         '-y',                                                  # Overwrite output file without asking
-        '-af', f'silencedetect=n=-50dB:d={silence_duration}',  # Audio filter for silence detection
+        '-af', f'silencedetect=n=-60dB:d={silence_duration}',  # Audio filter for silence detection
         '-loglevel', 'info',                                   # Set log level to info
         output_file
     ]
