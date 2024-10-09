@@ -14,14 +14,27 @@ from models import (
 )
 
 # Configure logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("agenda_processor.log"),
-        logging.StreamHandler()
-    ]
+# Setup Rotating File Handler
+from logging.handlers import RotatingFileHandler
+
+rotating_handler = RotatingFileHandler(
+    'agenda_processor.log', maxBytes=5*1024*1024, backupCount=5
+)  # 5 MB per file, 5 backups
+rotating_handler.setLevel(logging.INFO)
+rotating_formatter = logging.Formatter(
+    '%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S'
 )
+rotating_handler.setFormatter(rotating_formatter)
+logging.getLogger('').addHandler(rotating_handler)
+
+# Setup Console Handler
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)  # Changed to DEBUG for more detailed console output
+console_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+console_handler.setFormatter(console_formatter)
+logging.getLogger('').addHandler(console_handler)
+
+logging.info("Logging is set up successfully.")
 
 
 def parse_meeting_datetime(date_str, time_str=None):
@@ -441,7 +454,7 @@ def get_or_create_meeting_type(session, meeting_name, governing_body):
 
 def get_or_create_meeting(session, meeting_name, meeting_datetime, agenda_status, minutes_status,
                           meeting_location, published_agenda_url, published_minutes_url,
-                          meeting_video_url, meeting_type, meeting_url, transcript):
+                          meeting_video_url, meeting_type, meeting_url, transcript, processed):
     """
     Retrieves the Meeting from the database or creates it if it doesn't exist.
 
@@ -542,6 +555,7 @@ def get_or_create_agenda(session, meeting):
     Returns:
         Agenda instance or None if failed.
     """
+    logger = logging.getLogger('get_or_create_agenda')
     agenda = session.query(Agenda).filter_by(
         meetingid=meeting.meetingid
     ).first()
@@ -555,10 +569,20 @@ def get_or_create_agenda(session, meeting):
         try:
             session.commit()
             session.refresh(agenda)
-            logging.info(f"Created Agenda: {agenda.title} (ID: {agenda.agendaid})")
+            logger.info(f"Created Agenda: {agenda.title} (ID: {agenda.agendaid})")
         except SQLAlchemyError as e:
             session.rollback()
-            logging.error(f"Database error while creating Agenda: {e}")
+            logger.error(f"Database error while creating Agenda: {e}")
+            logger.debug(traceback.format_exc())
+            return None
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Unexpected error while creating Agenda: {e}")
+            logger.debug(traceback.format_exc())
+            return None
+    else:
+        logger.info(f"Retrieved Agenda: {agenda.title} (ID: {agenda.agendaid})")
+    return agenda
 
 # Function to save Legislation
 def save_legislation(session, file_number, version, status, description, link, index):
@@ -716,6 +740,7 @@ def save_meeting_data_to_db(url):
         meeting_video_url = meeting_details.get('Meeting Video URL', '')
         meeting_url = meeting_details.get('Meeting URL', '')
         transcript = meeting_details.get('Transcript', 'none')
+        processed = False
 
         # Parse the meeting date and time
         if meeting_date_str:
@@ -743,7 +768,7 @@ def save_meeting_data_to_db(url):
         # Get or create Meeting
         meeting = get_or_create_meeting(session, meeting_name, meeting_datetime, agenda_status, minutes_status,
                                        meeting_location, published_agenda_url, published_minutes_url,
-                                       meeting_video_url, meeting_type, meeting_url, transcript)
+                                       meeting_video_url, meeting_type, meeting_url, transcript, processed)
         if not meeting:
             logging.error("Failed to retrieve or create Meeting. Skipping this meeting.")
             return
